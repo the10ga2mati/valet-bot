@@ -1,193 +1,154 @@
-import logging
-import re
+import logging, re, json, os, random, string
 from datetime import datetime, timedelta
 import pytz
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
-import os
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
 TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = int(os.environ.get("CHAT_ID"))
 TIMEZONE = os.environ.get("TIMEZONE", "Europe/Bucharest")
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 tz = pytz.timezone(TIMEZONE)
+LISTS_FILE = "/tmp/lists.json"
+SHARED_FILE = "/tmp/shared_lists.json"
 
+def load_json(path):
+        try:
+                    with open(path) as f: return json.load(f)
+                            except: return {}
 
-def parse_reminder(text: str):
-    """Parse natural language Romanian/English reminder text."""
-    text_lower = text.lower().strip()
+    def save_json(path, data):
+            with open(path, "w") as f: json.dump(data, f, ensure_ascii=False, indent=2)
 
-    # Remove trigger phrases
-    for phrase in [
-        "reaminteste-mi", "reamintește-mi", "reminder", "aminteste-mi", "amintește-mi",
-        "nu uita", "remind me", "set reminder", "pune reminder"
-    ]:
-        text_lower = text_lower.replace(phrase, "").strip()
-
-    now = datetime.now(tz)
-    target_time = None
-    message = text_lower
-
-    # --- Patterns for time ---
-
-    # "maine la HH:MM" or "mâine la HH:MM"
-    m = re.search(r"(m[aâ]ine)\s+la\s+(\d{1,2}):?(\d{2})?", text_lower)
+        def parse_reminder(text):
+                tl = text.lower().strip()
+                for p in ["reaminteste-mi","reaminteste mi","reaminteste","reminder","aminteste-mi","aminteste mi","aminteste","nu uita","remind me","pune reminder"]:
+                            tl = tl.replace(p, "").strip()
+                        now = datetime.now(tz); tt = None; msg = tl
+    m = re.search(r"(maine)\s+la\s+(\d{1,2}):?(\d{2})?", tl)
     if m:
-        hour = int(m.group(2))
-        minute = int(m.group(3)) if m.group(3) else 0
-        target_time = (now + timedelta(days=1)).replace(hour=hour, minute=minute, second=0, microsecond=0)
-        message = re.sub(r"(m[aâ]ine)\s+la\s+\d{1,2}:?\d{0,2}", "", text_lower).strip()
-
-    # "azi la HH:MM" or "astazi la HH:MM"
-    if not target_time:
-        m = re.search(r"(azi|ast[aă]zi|today)\s+la\s+(\d{1,2}):?(\d{2})?", text_lower)
+                h=int(m.group(2)); mi=int(m.group(3)) if m.group(3) else 0
+        tt=(now+timedelta(days=1)).replace(hour=h,minute=mi,second=0,microsecond=0)
+        msg=re.sub(r"(maine)\s+la\s+\d{1,2}:?\d{0,2}","",tl).strip()
+    if not tt:
+                m=re.search(r"(azi|astazi|today)\s+la\s+(\d{1,2}):?(\d{2})?",tl)
         if m:
-            hour = int(m.group(2))
-            minute = int(m.group(3)) if m.group(3) else 0
-            target_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if target_time < now:
-                target_time += timedelta(days=1)
-            message = re.sub(r"(azi|ast[aă]zi|today)\s+la\s+\d{1,2}:?\d{0,2}", "", text_lower).strip()
-
-    # "la HH:MM" (today)
-    if not target_time:
-        m = re.search(r"\bla\s+(\d{1,2}):(\d{2})", text_lower)
+                        h=int(m.group(2)); mi=int(m.group(3)) if m.group(3) else 0
+                        tt=now.replace(hour=h,minute=mi,second=0,microsecond=0)
+                        if tt<now: tt+=timedelta(days=1)
+                                        msg=re.sub(r"(azi|astazi|today)\s+la\s+\d{1,2}:?\d{0,2}","",tl).strip()
+    if not tt:
+                m=re.search(r"\bla\s+(\d{1,2}):(\d{2})",tl)
         if m:
-            hour = int(m.group(1))
-            minute = int(m.group(2))
-            target_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if target_time < now:
-                target_time += timedelta(days=1)
-            message = re.sub(r"\bla\s+\d{1,2}:\d{2}", "", text_lower).strip()
-
-    # "in X minute/ore"
-    if not target_time:
-        m = re.search(r"[îi]n\s+(\d+)\s*(minut|minute|min|ore|ora|oră|hour|hours?)", text_lower)
+                        h=int(m.group(1)); mi=int(m.group(2))
+            tt=now.replace(hour=h,minute=mi,second=0,microsecond=0)
+            if tt<now: tt+=timedelta(days=1)
+                            msg=re.sub(r"\bla\s+\d{1,2}:\d{2}","",tl).strip()
+    if not tt:
+                m=re.search(r"in\s+(\d+)\s*(minut|minute|min|ore|ora|hour|hours?)",tl)
         if m:
-            amount = int(m.group(1))
-            unit = m.group(2)
-            if any(x in unit for x in ["minut", "min", "hour"]):
-                target_time = now + timedelta(minutes=amount)
-            else:
-                target_time = now + timedelta(hours=amount)
-            message = re.sub(r"[îi]n\s+\d+\s*(minut|minute|min|ore|ora|oră|hour|hours?)", "", text_lower).strip()
+                        amt=int(m.group(1)); unit=m.group(2)
+            tt=now+timedelta(minutes=amt) if any(x in unit for x in ["minut","min","hour"]) else now+timedelta(hours=amt)
+            msg=re.sub(r"in\s+\d+\s*(minut|minute|min|ore|ora|hour|hours?)","",tl).strip()
+    if not tt:
+                if any(x in tl for x in ["diminea","morning"]):
+                                tt=now.replace(hour=9,minute=0,second=0,microsecond=0)
+                                if tt<now: tt+=timedelta(days=1)
+                elif any(x in tl for x in ["seara","evening"]):
+            tt=now.replace(hour=20,minute=0,second=0,microsecond=0)
+            if tt<now: tt+=timedelta(days=1)
+            elif any(x in tl for x in ["pranz","lunch"]):
+            tt=now.replace(hour=13,minute=0,second=0,microsecond=0)
+            if tt<now: tt+=timedelta(days=1)
+                    for w in ["sa ","sa,","to ","maine","azi","astazi","today","dimineata","seara","pranz"]:
+                                msg=msg.replace(w,"")
+                            return tt, msg.strip(" ,.-") or text
 
-    # "dimineata" -> 9:00, "seara" -> 20:00, "pranz" -> 13:00
-    if not target_time:
-        if any(x in text_lower for x in ["diminea", "morning"]):
-            target_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
-            if target_time < now:
-                target_time += timedelta(days=1)
-        elif any(x in text_lower for x in ["seara", "evening", "tonight"]):
-            target_time = now.replace(hour=20, minute=0, second=0, microsecond=0)
-            if target_time < now:
-                target_time += timedelta(days=1)
-        elif any(x in text_lower for x in ["pranz", "lunch", "amiaz"]):
-            target_time = now.replace(hour=13, minute=0, second=0, microsecond=0)
-            if target_time < now:
-                target_time += timedelta(days=1)
+KNOWN_STORES = ["kaufland","lidl","mega","penny","profi","auchan","carrefour","selgros","rewe"]
 
-    # Clean up message
-    cleanup_words = [
-        "sa ", "să ", "to ", "ca sa ", "că să ",
-        "maine", "mâine", "azi", "astazi", "astăzi", "today",
-        "dimineata", "dimineață", "seara", "pranz",
-    ]
-    for w in cleanup_words:
-        message = message.replace(w, "")
-    message = message.strip(" ,.-")
+def detect_store(text):
+        t=text.lower()
+    for s in KNOWN_STORES:
+                if s in t: return s
+                        m=re.search(r"(?:pe lista|din lista|la lista|listei|lista)\s+(\w+)",t)
+    return m.group(1).lower() if m else None
 
-    return target_time, message if message else text
-
+def detect_item(text, store):
+        t=text.lower()
+    for p in ["adauga","pune","add","sterge","scoate","elimina","remove","am luat","baga"]:
+                t=t.replace(p,"")
+    if store: t=t.replace(store,"")
+            for p in ["pe lista","din lista","la lista","in lista"]: t=t.replace(p,"")
+                    return t.strip(" ,.-")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Salut! Sunt Valet, asistentul tău personal.\n\n"
-        "Îmi poți spune lucruri de genul:\n"
-        "• *reamintește-mi mâine la 11 să cumpăr pâine*\n"
-        "• *reminder în 30 minute să sun la doctor*\n"
-        "• *amintește-mi azi la 18:00 să plătesc factura*\n\n"
-        "Scrie /lista să vezi toate reminderele active.",
-        parse_mode="Markdown"
-    )
-
-
-async def lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    jobs = context.job_queue.jobs()
-    if not jobs:
-        await update.message.reply_text("📭 Nu ai niciun reminder activ.")
-        return
-
-    text = "📋 *Remindere active:*\n\n"
-    for i, job in enumerate(jobs, 1):
-        run_time = job.next_t.astimezone(tz).strftime("%d.%m.%Y %H:%M")
-        text += f"{i}. ⏰ {run_time} — {job.name}\n"
-
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    target_time, reminder_message = parse_reminder(text)
-
-    if not target_time:
         await update.message.reply_text(
-            "🤔 Nu am înțeles când să îți amintesc. Încearcă de genul:\n"
-            "*reamintește-mi mâine la 11 să cumpăr pâine*",
-            parse_mode="Markdown"
-        )
-        return
+                    "Salut! Sunt *Valet*, asistentul tau personal.\n\n"
+                    "*Liste de cumparaturi:*\n"
+                    "- adauga iaurt pe lista lidl\n"
+                    "- arata lista kaufland\n"
+                    "- sterge lapte din lista lidl\n"
+                    "- reseteaza lista lidl\n"
+                    "- /liste - toate listele\n\n"
+                    "*Liste partajate:*\n"
+                    "- /lista\_noua gratar\n"
+                    "- /join\_lista COD\n\n"
+                    "*Remindere:*\n"
+                    "- reaminteste-mi maine la 11 sa cumpar paine\n"
+                    "- reminder in 30 minute sa sun\n"
+                    "- /remindere - remindere active",
+                    parse_mode="Markdown")
 
-    now = datetime.now(tz)
-    if target_time < now:
-        await update.message.reply_text("⚠️ Ora respectivă a trecut deja. Încearcă altă oră.")
-        return
+async def cmd_liste(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        lists=load_json(LISTS_FILE); shared=load_json(SHARED_FILE)
+    if not lists and not shared:
+                await update.message.reply_text("Nu ai nicio lista. Ex: adauga lapte pe lista lidl"); return
+    text="*Listele tale:*\n\n"
+    for store,items in lists.items():
+                text+=f"{'OK' if items else '--'} *{store.capitalize()}* - {len(items)} produse\n"
+    if shared:
+                text+="\n*Liste partajate:*\n"
+        for code,lst in shared.items():
+                        text+=f"- *{lst['name'].capitalize()}* (cod: {code}) - {len(lst['items'])} produse\n"
+                await update.message.reply_text(text,parse_mode="Markdown")
 
-    delay = (target_time - now).total_seconds()
-    readable_time = target_time.strftime("%d.%m.%Y la %H:%M")
+async def cmd_lista_noua(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args: await update.message.reply_text("Ex: /lista_noua gratar"); return
+                name="_".join(context.args).lower(); shared=load_json(SHARED_FILE)
+    code="".join(random.choices(string.ascii_uppercase+string.digits,k=6))
+    shared[code]={"name":name,"items":[],"owner":update.effective_user.id}; save_json(SHARED_FILE,shared)
+    await update.message.reply_text(f"Lista *{name}* creata!\nCod pentru prieteni: `{code}`\nEi scriu: /join\_lista {code}",parse_mode="Markdown")
 
-    context.job_queue.run_once(
-        send_reminder,
-        when=delay,
-        chat_id=update.effective_chat.id,
-        name=reminder_message,
-        data=reminder_message,
-    )
+async def cmd_join_lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args: await update.message.reply_text("Ex: /join_lista ABC123"); return
+                code=context.args[0].upper(); shared=load_json(SHARED_FILE)
+    if code not in shared: await update.message.reply_text("Cod invalid."); return
+            name=shared[code]["name"]
+    await update.message.reply_text(f"Te-ai alaturat listei *{name}*!\nAdauga cu: adauga ceva pe lista {name}",parse_mode="Markdown")
 
-    await update.message.reply_text(
-        f"✅ Reminder setat!\n⏰ Te anunț pe *{readable_time}*\n📝 _{reminder_message}_",
-        parse_mode="Markdown"
-    )
-
+async def cmd_remindere(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        jobs=context.job_queue.jobs()
+    if not jobs: await update.message.reply_text("Nu ai niciun reminder activ."); return
+            text="*Remindere active:*\n\n"
+    for i,job in enumerate(jobs,1):
+                rt=job.next_t.astimezone(tz).strftime("%d.%m.%Y %H:%M")
+        text+=f"{i}. {rt} - {job.name}\n"
+    await update.message.reply_text(text,parse_mode="Markdown")
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    await context.bot.send_message(
-        chat_id=job.chat_id,
-        text=f"🔔 *Reminder!*\n\n➡️ {job.data}",
-        parse_mode="Markdown"
-    )
+        job=context.job
+    await context.bot.send_message(chat_id=job.chat_id,text=f"Reminder!\n\n{job.data}",parse_mode="Markdown")
 
-
-def main():
-    app = Application.builder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("lista", lista))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logger.info("Valet Bot pornit!")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query=update.callback_query; await query.answer()
+    parts=query.data.split("|"); action=parts[0]
+    if action=="check":
+                store,idx=parts[1],int(parts[2]); lists=load_json(LISTS_FILE); shared=load_json(SHARED_FILE)
+        if store in lists and idx<len(lists[store]):
+                        item=lists[store].pop(idx); save_json(LISTS_FILE,lists)
+                        await query.edit_message_text(f"*{item.capitalize()}* bifat!",parse_mode="Markdown")
+else:
+            for code,lst in shared.items():
+                                if lst["name"]==store and idx<len(lst["items"]):
+                                                        ite
