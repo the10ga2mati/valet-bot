@@ -1,17 +1,21 @@
 import logging, re, json, os, random, string
 from datetime import datetime, timedelta
 import pytz
+import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
 TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = int(os.environ.get("CHAT_ID"))
 TIMEZONE = os.environ.get("TIMEZONE", "Europe/Bucharest")
+CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY")
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 tz = pytz.timezone(TIMEZONE)
 LISTS_FILE = "/tmp/lists.json"
 SHARED_FILE = "/tmp/shared_lists.json"
+HISTORY_FILE = "/tmp/history.json"
 
 def load_json(path):
     try:
@@ -24,165 +28,125 @@ def save_json(path, data):
     with open(path, "w") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def parse_reminder(text):
-    tl = text.lower().strip()
-    for p in ["reaminteste-mi","reaminteste mi","reaminteste","reminder",
-              "aminteste-mi","aminteste mi","aminteste","nu uita","remind me","pune reminder"]:
-        tl = tl.replace(p, "").strip()
-    now = datetime.now(tz)
-    tt = None
-    msg = tl
-    m = re.search(r"(maine)\s+la\s+(\d{1,2}):?(\d{2})?", tl)
-    if m:
-        h = int(m.group(2))
-        mi = int(m.group(3)) if m.group(3) else 0
-        tt = (now + timedelta(days=1)).replace(hour=h, minute=mi, second=0, microsecond=0)
-        msg = re.sub(r"(maine)\s+la\s+\d{1,2}:?\d{0,2}", "", tl).strip()
-    if not tt:
-        m = re.search(r"(azi|astazi|today)\s+la\s+(\d{1,2}):?(\d{2})?", tl)
-        if m:
-            h = int(m.group(2))
-            mi = int(m.group(3)) if m.group(3) else 0
-            tt = now.replace(hour=h, minute=mi, second=0, microsecond=0)
-            if tt < now:
-                tt += timedelta(days=1)
-            msg = re.sub(r"(azi|astazi|today)\s+la\s+\d{1,2}:?\d{0,2}", "", tl).strip()
-    if not tt:
-        m = re.search(r"\bla\s+(\d{1,2}):(\d{2})", tl)
-        if m:
-            h = int(m.group(1))
-            mi = int(m.group(2))
-            tt = now.replace(hour=h, minute=mi, second=0, microsecond=0)
-            if tt < now:
-                tt += timedelta(days=1)
-            msg = re.sub(r"\bla\s+\d{1,2}:\d{2}", "", tl).strip()
-    if not tt:
-        m = re.search(r"in\s+(\d+)\s*(minut|minute|min|ore|ora|hour|hours?)", tl)
-        if m:
-            amt = int(m.group(1))
-            unit = m.group(2)
-            if any(x in unit for x in ["minut", "min", "hour"]):
-                tt = now + timedelta(minutes=amt)
-            else:
-                tt = now + timedelta(hours=amt)
-            msg = re.sub(r"in\s+\d+\s*(minut|minute|min|ore|ora|hour|hours?)", "", tl).strip()
-    if not tt:
-        if any(x in tl for x in ["diminea", "morning"]):
-            tt = now.replace(hour=9, minute=0, second=0, microsecond=0)
-            if tt < now:
-                tt += timedelta(days=1)
-        elif any(x in tl for x in ["seara", "evening"]):
-            tt = now.replace(hour=20, minute=0, second=0, microsecond=0)
-            if tt < now:
-                tt += timedelta(days=1)
-        elif any(x in tl for x in ["pranz", "lunch"]):
-            tt = now.replace(hour=13, minute=0, second=0, microsecond=0)
-            if tt < now:
-                tt += timedelta(days=1)
-    for w in ["sa ", "sa,", "to ", "maine", "azi", "astazi", "today", "dimineata", "seara", "pranz"]:
-        msg = msg.replace(w, "")
-    return tt, msg.strip(" ,.-") or text
-
-KNOWN_STORES = ["kaufland", "lidl", "mega", "penny", "profi", "auchan", "carrefour", "selgros", "rewe"]
-
-def detect_store(text):
-    t = text.lower()
-    for s in KNOWN_STORES:
-        if s in t:
-            return s
-    m = re.search(r"(?:pe lista|din lista|la lista|listei|lista)\s+(\w+)", t)
-    return m.group(1).lower() if m else None
-
-def detect_item(text, store):
-    t = text.lower()
-    for p in ["adauga", "pune", "add", "sterge", "scoate", "elimina", "remove", "am luat", "baga"]:
-        t = t.replace(p, "")
-    if store:
-        t = t.replace(store, "")
-    for p in ["pe lista", "din lista", "la lista", "in lista"]:
-        t = t.replace(p, "")
-    return t.strip(" ,.-")
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Salut! Sunt *Valet*, asistentul tau personal.\n\n"
-        "*Liste de cumparaturi:*\n"
-        "- adauga iaurt pe lista lidl\n"
-        "- arata lista kaufland\n"
-        "- sterge lapte din lista lidl\n"
-        "- reseteaza lista lidl\n"
-        "- /liste - toate listele\n\n"
-        "*Liste partajate:*\n"
-        "- /lista\\_noua gratar\n"
-        "- /join\\_lista COD\n\n"
-        "*Remindere:*\n"
-        "- reaminteste-mi maine la 11 sa cumpar paine\n"
-        "- reminder in 30 minute sa sun\n"
-        "- /remindere - remindere active",
-        parse_mode="Markdown"
-    )
-
-async def cmd_liste(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def get_context_for_claude():
     lists = load_json(LISTS_FILE)
     shared = load_json(SHARED_FILE)
-    if not lists and not shared:
-        await update.message.reply_text("Nu ai nicio lista. Ex: adauga lapte pe lista lidl")
-        return
-    text = "*Listele tale:*\n\n"
-    for store, items in lists.items():
-        e = "OK" if items else "--"
-        text += f"{e} *{store.capitalize()}* - {len(items)} produse\n"
+    now = datetime.now(tz).strftime("%d.%m.%Y %H:%M")
+    ctx = f"Data si ora curenta: {now} (fusul orar: Europe/Bucharest)\n\n"
+    if lists:
+        ctx += "Liste de cumparaturi ale utilizatorului:\n"
+        for store, items in lists.items():
+            ctx += f"- {store.capitalize()}: {', '.join(items) if items else '(goala)'}\n"
+        ctx += "\n"
     if shared:
-        text += "\n*Liste partajate:*\n"
+        ctx += "Liste partajate:\n"
         for code, lst in shared.items():
-            text += f"- *{lst['name'].capitalize()}* (cod: {code}) - {len(lst['items'])} produse\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
+            ctx += f"- {lst['name'].capitalize()} (cod: {code}): {', '.join(lst['items']) if lst['items'] else '(goala)'}\n"
+        ctx += "\n"
+    return ctx
 
-async def cmd_lista_noua(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Ex: /lista_noua gratar")
-        return
-    name = "_".join(context.args).lower()
-    shared = load_json(SHARED_FILE)
-    code = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
-    shared[code] = {"name": name, "items": [], "owner": update.effective_user.id}
-    save_json(SHARED_FILE, shared)
-    await update.message.reply_text(
-        f"Lista *{name}* creata!\nCod pentru prieteni: `{code}`\nEi scriu: /join\\_lista {code}",
-        parse_mode="Markdown"
-    )
+async def ask_claude(user_message: str, chat_id: int) -> str:
+    history = load_json(HISTORY_FILE)
+    user_history = history.get(str(chat_id), [])
 
-async def cmd_join_lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Ex: /join_lista ABC123")
-        return
-    code = context.args[0].upper()
-    shared = load_json(SHARED_FILE)
-    if code not in shared:
-        await update.message.reply_text("Cod invalid.")
-        return
-    name = shared[code]["name"]
-    await update.message.reply_text(
-        f"Te-ai alaturat listei *{tst.capitalize()}*!\nAdauga cu: adauga ceva pe lista {name}",
-        parse_mode="Markdown"
-    )
+    context = get_context_for_claude()
 
-async def cmd_remindere(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    jobs = context.job_queue.jobs()
-    if not jobs:
-        await update.message.reply_text("Nu ai niciun reminder activ.")
-        return
-    text = "*Remindere active:*\n\n"
-    for i, job in enumerate(jobs, 1):
-        rt = job.next_t.astimezone(tz).strftime("%d.%m.%Y %H:%M")
-        text += f"{i}. {rt} - {job.name}\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
+    system_prompt = f"""Esti ValetBot, asistentul personal inteligent al lui Cosmin. Vorbesti in romana, esti prietenos si concis.
+
+{context}
+
+Poti ajuta cu:
+1. REMINDER-URI - Cand utilizatorul vrea un reminder, raspunde cu un JSON special in mesajul tau:
+   {{REMINDER: "descriere", TIME: "HH:MM", DATE: "DD.MM.YYYY"}}
+   Exemplu: Daca zice "reaminteste-mi diseara la 18:00 sa sun la hidroelectrica", raspunzi normal SI incluzi {{REMINDER: "suna la hidroelectrica", TIME: "18:00", DATE: "23.04.2026"}}
+
+2. LISTE - Cand utilizatorul vrea sa adauge/sterga/vada liste, raspunde cu JSON special:
+   {{LIST_ADD: "produs", STORE: "magazin"}} - pentru adaugare
+   {{LIST_SHOW: "magazin"}} - pentru afisare
+   {{LIST_RESET: "magazin"}} - pentru resetare
+   {{LIST_REMOVE: "produs", STORE: "magazin"}} - pentru stergere
+
+3. CONVERSATIE GENERALA - Raspunde natural la orice alta intrebare.
+
+IMPORTANT: Poti include atat text normal CAT SI JSON-ul special in acelasi raspuns. Textul normal va fi afisat utilizatorului, JSON-ul va fi procesat automat.
+Nu explica ce faci cu JSON-ul, doar include-l natural in raspuns."""
+
+    messages = user_history[-10:] + [{"role": "user", "content": user_message}]
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": CLAUDE_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json"
+                },
+                json={
+                    "model": "claude-hanku-4-5-20251001",
+                    "max_tokens": 1024,
+                    "system": system_prompt,
+                    "messages": messages
+                }
+            )
+            data = response.json()
+            assistant_message = data["content"][0]["text"]
+
+            user_history.append({"role": "user", "content": user_message})
+            user_history.append({"role": "assistant", "content": assistant_message})
+            history[str(chat_id)] = user_history[-20:]
+            save_json(HISTORY_FILE, history)
+
+            return assistant_message
+    except Exception as e:
+        logger.error(f"Claude API error: {e}")
+        return "Scuze, am o problema tehnica momentan. Incearca din nou!"
+
+def parse_claude_response(response: str, context):
+    text_to_show = response
+    actions = []
+
+    reminder_match = re.search(r'\{REMINDER:\s*"([^"]+)",\s*TIME:\s*"(\d{2}:\d{2})",\s*DATE:\s*"(\d{2}\.\d{2}\.\d{4})"\}', response)
+    if reminder_match:
+        desc = reminder_match.group(1)
+        time_str = reminder_match.group(2)
+        date_str = reminder_match.group(3)
+        actions.append(("reminder", desc, time_str, date_str))
+        text_to_show = re.sub(r'\{REMINDER:[^}]+\}', '', text_to_show).strip()
+
+    list_add_match = re.search(r'\{LIST_ADD:\s*"([^"]+)",\s*STORE:\s*"([^"]+)"\}', response)
+    if list_add_match:
+        item = list_add_match.group(1)
+        store = list_add_match.group(2).lower()
+        actions.append(("list_add", item, store))
+        text_to_show = re.sub(r'\{LIST_ADD:[^}]+\}', '', text_to_show).strip()
+
+    list_show_match = re.search(r'\{LIST_SHOW:\s*"([^"]+)"\}', response)
+    if list_show_match:
+        store = list_show_match.group(1).lower()
+        actions.append(("list_show", store))
+        text_to_show = re.sub(r'\{LIST_SHOW:[^}]+\}', '', text_to_show).strip()
+
+    list_reset_match = re.search(r'\{LIST_RESET:\s*"([^"]+)"\}', response)
+    if list_reset_match:
+        store = list_reset_match.group(1).lower()
+        actions.append(("list_reset", store))
+        text_to_show = re.sub(r'\{LIST_RESET:[^}]+\}', '', text_to_show).strip()
+
+    list_remove_match = re.search(r'\{LIST_REMOVE:\s*"([^"]+)",\s*STORE:\s*"([^"]+)"\}', response)
+    if list_remove_match:
+        item = list_remove_match.group(1)
+        store = list_remove_match.group(2).lower()
+        actions.append(("list_remove", item, store))
+        text_to_show = re.sub(r'\{LIST_REMOVE:[^}]+\}', '', text_to_show).strip()
+
+    return text_to_show.strip(), actions
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     await context.bot.send_message(
         chat_id=job.chat_id,
-        text=f"Reminder!\n\n{job.data}",
+        text=f"ð *Reminder!*\n\nâ¡ï¸ {job.data}",
         parse_mode="Markdown"
     )
 
@@ -192,167 +156,118 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = query.data.split("|")
     action = parts[0]
     if action == "check":
-        store = parts[1]
-        idx = int(parts[2])
+        store, idx = parts[1], int(parts[2])
         lists = load_json(LISTS_FILE)
-        shared = load_json(SHARED_FILE)
         if store in lists and idx < len(lists[store]):
             item = lists[store].pop(idx)
             save_json(LISTS_FILE, lists)
-            await query.edit_message_text(f"*{item.capitalize()}* bifat!", parse_mode="Markdown")
-        else:
-            for code, lst in shared.items():
-                if lst["name"] == store and idx < len(lst["items"]):
-                    item = lst["items"].pop(idx)
-                    save_json(SHARED_FILE, shared)
-                    await query.edit_message_text(f"*{item.capitalize()}* bifat!", parse_mode="Markdown")
-                    break
+            await query.edit_message_text(f"â *{item.capitalize()}* bifat!", parse_mode="Markdown")
     elif action == "reset":
         store = parts[1]
         lists = load_json(LISTS_FILE)
-        shared = load_json(SHARED_FILE)
         if store in lists:
             lists[store] = []
             save_json(LISTS_FILE, lists)
-        else:
-            for code, lst in shared.items():
-                if lst["name"] == store:
-                    lst["items"] = []
-            save_json(SHARED_FILE, shared)
-        await query.edit_message_text(f"Lista *{store.capitalize()}* golita!", parse_mode="Markdown")
+        await query.edit_message_text(f"ðï¸ Lista *{store.capitalize()}* golita!", parse_mode="Markdown")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "ð Salut! Sunt *ValetBot*, asistentul tau personal cu AI!\n\n"
+        "Poti sa-mi vorbesti *natural*, in romana:\n\n"
+        "â° _Reaminteste-mi diseara la 18:00 sa sun la Hidroelectrica_\n"
+        "ð _Adauga lapte si paine pe lista Lidl_\n"
+        "ð _Arata-mi lista de la Kaufland_\n"
+        "ð¬ _Orice alta intrebare sau conversatie_\n\n"
+        "Sunt conectat la Claude AI si te inteleg! ð§ ",
+        parse_mode="Markdown"
+    )
+
+async def cmd_liste(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lists = load_json(LISTS_FILE)
+    if not lists:
+        await update.message.reply_text("Nu ai nicio lista. Spune-mi ce vrei sa adaugi!")
+        return
+    text = "ð *Listele tale:*\n\n"
+    for store, items in lists.items():
+        e = "ð¢" if items else "â¬"
+        text += f"{e} *{store.capitalize()}* - {len(items)} produse\n"
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    t = text.lower().strip()
+    user_message = update.message.text
+    chat_id = update.effective_chat.id
 
-    is_add = any(t.startswith(x) or (" " + x + " ") in (" " + t + " ") for x in ["adauga", "pune", "baga", "bag", "add"])
-    is_show = any(x in t for x in ["arata lista", "arata-mi lista", "show list", "ce am pe lista", "ce e pe lista", "ce mai am pe lista"])
-    is_remove = any(t.startswith(x) or (" " + x + " ") in (" " + t + " ") for x in ["sterge", "scoate", "elimina", "remove", "am luat"])
-    is_reset = any(x in t for x in ["reseteaza lista", "goleste lista", "sterge lista", "clear lista", "gata am fost la", "am terminat la"])
-    is_reminder = any(x in t for x in ["reaminteste", "aminteste", "reminder", "remind me", "nu uita"])
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-    store = detect_store(t)
-    shared = load_json(SHARED_FILE)
-    sst = None
-    for code, lst in shared.items():
-        if lst["name"] in t:
-            sst = (code, lst["name"])
-            break
-    tst = sst[1] if sst else store
+    claude_response = await ask_claude(user_message, chat_id)
+    text_to_show, actions = parse_claude_response(claude_response, context)
 
-    if is_reset and tst:
-        if sst:
-            shared[sst[0]]["items"] = []
-            save_json(SHARED_FILE, shared)
-        else:
-            ls = load_json(LISTS_FILE)
-            ls[store] = []
-            save_json(LISTS_FILE, ls)
-        await update.message.reply_text(f"Lista *{tst.capitalize()}* golita!", parse_mode="Markdown")
-        return
+    for action in actions:
+        if action[0] == "reminder":
+            _, desc, time_str, date_str = action
+            try:
+                dt = datetime.strptime(f"{date_str} {time_str}", "%d.%m.%Y %H:%M")
+                dt = tz.localize(dt)
+                now = datetime.now(tz)
+                delay = (dt - now).total_seconds()
+                if delay > 0:
+                    context.job_queue.run_once(
+                        send_reminder,
+                        when=delay,
+                        chat_id=chat_id,
+                        name=desc,
+                        data=desc
+                    )
+            except Exception as e:
+                logger.error(f"Reminder error: {e}")
 
-    if is_show and tst:
-        if sst:
-            items = shared[sst[0]]["items"]
-        else:
-            items = load_json(LISTS_FILE).get(store, [])
-        if not items:
-            await update.message.reply_text(f"Lista *{tst.capitalize()}* e goala.", parse_mode="Markdown")
-        else:
-            num = "\n".join(f"{i+1}. {it}" for i, it in enumerate(items))
-            kb = [[InlineKeyboardButton(f"OK {it}", callback_data=f"check|{tst}|{idx}")] for idx, it in enumerate(items)]
-            kb.append([InlineKeyboardButton("Goleste lista", callback_data=f"reset|{tst}")])
-            await update.message.reply_text(
-                f"*Lista {tst.capitalize()}:*\n\n{num}\n\nApasa pe produs cand l-ai luat!",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(kb)
-            )
-        return
+        elif action[0] == "list_add":
+            _, item, store = action
+            lists = load_json(LISTS_FILE)
+            if store not in lists:
+                lists[store] = []
+            lists[store].append(item)
+            save_json(LISTS_FILE, lists)
 
-    if is_add and tst:
-        item = detect_item(text, tst)
-        if not item:
-            await update.message.reply_text("Nu am inteles ce sa adaug. Ex: adauga lapte pe lista lidl")
-            return
-        if sst:
-            shared[sst[0]]["items"].append(item)
-            save_json(SHARED_FILE, shared)
-        else:
-            ls = load_json(LISTS_FILE)
-            if store not in ls:
-                ls[store] = []
-            ls[store].append(item)
-            save_json(LISTS_FILE, ls)
-        await update.message.reply_text(
-            f"*{item.capitalize()}* adaugat pe lista *{tst.capitalize()}*!",
-            parse_mode="Markdown"
-        )
-        return
+        elif action[0] == "list_show":
+            _, store = action
+            lists = load_json(LISTS_FILE)
+            items = lists.get(store, [])
+            if items:
+                num = "\n".join(f"{i+1}. {it}" for i, it in enumerate(items))
+                kb = [[InlineKeyboardButton(f"â {it}", callback_data=f"check|{store}|{idx}")] for idx, it in enumerate(items)]
+                kb.append([InlineKeyboardButton("ðï¸ Goleste lista", callback_data=f"reset|{store}")])
+                await update.message.reply_text(
+                    f"ð *Lista {store.capitalize()}:*\n\n{num}\n\n_Apasa pe produs cand l-ai luat!_",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(kb)
+                )
 
-    if is_remove and tst:
-        item = detect_item(text, tst)
-        if sst:
-            ls_items = shared[sst[0]]["items"]
-        else:
-            ls_items = load_json(LISTS_FILE).get(store, [])
-        matches = [x for x in ls_items if item in x.lower()]
-        if matches:
-            if sst:
-                shared[sst[0]]["items"].remove(matches[0])
-                save_json(SHARED_FILE, shared)
-            else:
-                ls = load_json(LISTS_FILE)
-                ls[store].remove(matches[0])
-                save_json(LISTS_FILE, ls)
-            await update.message.reply_text(f"*{matches[0].capitalize()}* sters!", parse_mode="Markdown")
-        else:
-            await update.message.reply_text(f"Nu am gasit {item} pe lista.")
-        return
+        elif action[0] == "list_reset":
+            _, store = action
+            lists = load_json(LISTS_FILE)
+            lists[store] = []
+            save_json(LISTS_FILE, lists)
 
-    if is_reminder:
-        tt, rem = parse_reminder(text)
-        if not tt:
-            await update.message.reply_text(
-                "Nu am inteles cand. Ex: reaminteste-mi maine la 11 sa cumpar paine"
-            )
-            return
-        now = datetime.now(tz)
-        if tt < now:
-            await update.message.reply_text("Ora a trecut deja.")
-            return
-        delay = (tt - now).total_seconds()
-        rt = tt.strftime("%d.%m.%Y la %H:%M")
-        context.job_queue.run_once(
-            send_reminder,
-            when=delay,
-            chat_id=update.effective_chat.id,
-            name=rem,
-            data=rem
-        )
-        await update.message.reply_text(
-            f"Reminder setat!\nTe anunt pe *{rt}*\n_{rem}_",
-            parse_mode="Markdown"
-        )
-        return
+        elif action[0] == "list_remove":
+            _, item, store = action
+            lists = load_json(LISTS_FILE)
+            lst = lists.get(store, [])
+            matches = [x for x in lst if item.lower() in x.lower()]
+            if matches:
+                lists[store].remove(matches[0])
+                save_json(LISTS_FILE, lists)
 
-    await update.message.reply_text(
-        "Nu am inteles. Incearca:\n"
-        "- adauga lapte pe lista lidl\n"
-        "- arata lista kaufland\n"
-        "- reaminteste-mi maine la 10 sa...\n"
-        "- /start pentru toate comenzile"
-    )
+    if text_to_show:
+        await update.message.reply_text(text_to_show, parse_mode="Markdown")
 
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("liste", cmd_liste))
-    app.add_handler(CommandHandler("lista_noua", cmd_lista_noua))
-    app.add_handler(CommandHandler("join_lista", cmd_join_lista))
-    app.add_handler(CommandHandler("remindere", cmd_remindere))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("Valet Bot pornit!")
+    logger.info("ValetBot AI pornit!")
     app.run_polling()
 
 if __name__ == "__main__":
